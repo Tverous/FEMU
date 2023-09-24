@@ -7,6 +7,10 @@
 #define INVALID_LPN     (~(0ULL))
 #define UNMAPPED_PPA    (~(0ULL))
 
+#ifndef FTL_MAPPING_TBL_MODE
+#define FTL_MAPPING_TBL_MODE 0
+#endif
+
 enum {
     NAND_READ =  0,
     NAND_WRITE = 1,
@@ -198,7 +202,12 @@ struct ssd {
     char *ssdname;
     struct ssdparams sp;
     struct ssd_channel *ch;
-    struct ppa *maptbl; /* page level mapping table */
+    #if FTL_MAPPING_TBL_MODE == 0 || FTL_MAPPING_TBL_MODE == 1
+        struct ppa *maptbl; /* page level mapping table */
+    #elif FTL_MAPPING_TBL_MODE == 2
+        struct ppa *logtbl; /* page-level mapping table */
+        struct ppa *datatbl; /* block-level mapping table */
+    #endif
     uint64_t *rmap;     /* reverse mapptbl, assume it's stored in OOB */
     struct write_pointer wp;
     struct line_mgmt lm;

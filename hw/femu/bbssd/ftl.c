@@ -16,7 +16,11 @@ static inline bool should_gc_high(struct ssd *ssd)
 
 static inline struct ppa get_maptbl_ent(struct ssd *ssd, uint64_t lpn)
 {
-    return ssd->maptbl[lpn];
+    #if FTL_MAPPING_TBL_MODE == 0 || FTL_MAPPING_TBL_MODE == 1
+        return ssd->maptbl[lpn];
+    #elif FTL_MAPPING_TBL_MODE == 2
+        return ssd->datatbl[lpn];
+    #endif
 }
 
 static inline void set_maptbl_ent(struct ssd *ssd, uint64_t lpn, struct ppa *ppa)
@@ -344,20 +348,58 @@ static void ssd_init_maptbl(struct ssd *ssd)
 {
     struct ssdparams *spp = &ssd->sp;
 
-    ssd->maptbl = g_malloc0(sizeof(struct ppa) * spp->tt_pgs);
-    for (int i = 0; i < spp->tt_pgs; i++) {
-        ssd->maptbl[i].ppa = UNMAPPED_PPA;
-    }
+    // page-level mapping
+    #if FTL_MAPPING_TBL_MODE == 0
+        ssd->maptbl = g_malloc0(sizeof(struct ppa) * spp->tt_pgs);
+        for (int i = 0; i < spp->tt_pgs; i++) {
+            ssd->maptbl[i].ppa = UNMAPPED_PPA;
+        }
+    // block-based mapping
+    #elif FTL_MAPPING_TBL_MODE == 1
+        ssd->maptbl = g_malloc0(sizeof(struct ppa) * spp->tt_blks);
+        for (int i = 0; i < spp->tt_blks; i++) {
+            ssd->maptbl[i].ppa = UNMAPPED_PPA;
+        }
+    // hybrid mapping
+    #elif FTL_MAPPING_TBL_MODE == 2
+        ssd->logtbl = g_malloc0(sizeof(struct ppa) * spp->tt_pgs);
+        ssd->datatbl = g_malloc0(sizeof(struct ppa) * spp->tt_blks);
+        for (int i = 0; i < spp->tt_pgs; i++) {
+            ssd->logtbl[i].ppa = UNMAPPED_PPA;
+        }
+        for (int i = 0; i < spp->tt_blks; i++) {
+            ssd->datatbl[i].ppa = UNMAPPED_PPA;
+        }
+    #else
+        ftl_err("Unsupported FTL_MAPPING_TBL_MODE: %d\n", FTL_MAPPING_TBL_MODE);
+    #endif
 }
 
 static void ssd_init_rmap(struct ssd *ssd)
 {
     struct ssdparams *spp = &ssd->sp;
 
-    ssd->rmap = g_malloc0(sizeof(uint64_t) * spp->tt_pgs);
-    for (int i = 0; i < spp->tt_pgs; i++) {
-        ssd->rmap[i] = INVALID_LPN;
-    }
+    // page-level mapping
+    #if FTL_MAPPING_TBL_MODE == 0
+        ssd->rmap = g_malloc0(sizeof(uint64_t) * spp->tt_pgs);
+        for (int i = 0; i < spp->tt_pgs; i++) {
+            ssd->rmap[i] = INVALID_LPN;
+        }
+    // block-based mapping
+    #elif FTL_MAPPING_TBL_MODE == 1
+        ssd->rmap = g_malloc0(sizeof(uint64_t) * spp->tt_blks);
+        for (int i = 0; i < spp->tt_blks; i++) {
+            ssd->rmap[i] = INVALID_LPN;
+        }
+    #elif FTL_MAPPING_TBL_MODE == 2
+        // erase the block for gc in hybrid mode
+        ssd->rmap = g_malloc0(sizeof(uint64_t) * spp->tt_blks);
+        for (int i = 0; i < spp->tt_blks; i++) {
+            ssd->rmap[i] = INVALID_LPN;
+        }
+    #else
+        ftl_err("Unsupported FTL_MAPPING_TBL_MODE: %d\n", FTL_MAPPING_TBL_MODE);
+    #endif
 }
 
 void ssd_init(FemuCtrl *n)
@@ -770,21 +812,57 @@ static int do_gc(struct ssd *ssd, bool force)
 static uint64_t ssd_read(struct ssd *ssd, NvmeRequest *req)
 {
     struct ssdparams *spp = &ssd->sp;
+    // logical block address
     uint64_t lba = req->slba;
-    int nsecs = req->nlb;
-    struct ppa ppa;
-    uint64_t start_lpn = lba / spp->secs_per_pg;
-    uint64_t end_lpn = (lba + nsecs - 1) / spp->secs_per_pg;
+
+    #if FTL_MAPPING_TBL_MODE == 0
+        // number of sectors
+        int nsecs = req->nlb;
+        struct ppa ppa;
+        // start logical page number
+        uint64_t start_lpn = lba / spp->secs_per_pg;
+        // end logical page number
+        uint64_t end_lpn = (lba + nsecs - 1) / spp->secs_per_pg;
+    #elif FTL_MAPPING_TBL_MODE == 1
+        // number of sectors
+        int nsecs = req->nlb;
+        struct ppa ppa;
+        // start logical page number, use as chunk number in here
+        uint64_t start_lpn = lba / spp->secs_per_blk;
+        // end logical page number, user as chunk number in here
+        uint64_t end_lpn = (lba + nsecs - 1) / spp->secs_per_blk;
+    #elif FTL_MAPPING_TBL_MODE == 2
+        // number of sectors
+        int nsecs = req->nlb;
+        struct ppa ppa;
+        // start logical page number, use as chunk number in here
+        uint64_t start_lpn = lba / spp->secs_per_blk;
+        // end logical page number, user as chunk number in here
+        uint64_t end_lpn = (lba + nsecs - 1) / spp->secs_per_blk;
+    #endif
+    
     uint64_t lpn;
     uint64_t sublat, maxlat = 0;
 
+    // check if the last logical page number exceeds the total number of pages
+    //  TODO: assert the offset for block-based mapping
     if (end_lpn >= spp->tt_pgs) {
         ftl_err("start_lpn=%"PRIu64",tt_pgs=%d\n", start_lpn, ssd->sp.tt_pgs);
     }
 
     /* normal IO read path */
     for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
-        ppa = get_maptbl_ent(ssd, lpn);
+        #if FTL_MAPPING_TBL_MODE == 0
+            ppa = get_maptbl_ent(ssd, lpn);
+        #elif FTL_MAPPING_TBL_MODE == 1
+            ppa = get_maptbl_ent(ssd, lpn);
+            uint64_t offset = lba % spp->secs_per_blk;
+            // TODO: use ppa.ppa + offset or ppa.g.pg + offset ?
+            ppa.g.pg = ppa.g.pg + offset;
+        #elif FTL_MAPPING_TBL_MODE == 2
+            
+        #endif
+
         if (!mapped_ppa(&ppa) || !valid_ppa(ssd, &ppa)) {
             //printf("%s,lpn(%" PRId64 ") not mapped to valid ppa\n", ssd->ssdname, lpn);
             //printf("Invalid ppa,ch:%d,lun:%d,blk:%d,pl:%d,pg:%d,sec:%d\n",
@@ -807,31 +885,59 @@ static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
 {
     uint64_t lba = req->slba;
     struct ssdparams *spp = &ssd->sp;
-    int len = req->nlb;
-    uint64_t start_lpn = lba / spp->secs_per_pg;
-    uint64_t end_lpn = (lba + len - 1) / spp->secs_per_pg;
+
+    #if FTL_MAPPING_TBL_MODE == 0
+        int len = req->nlb;
+        uint64_t start_lpn = lba / spp->secs_per_pg;
+        uint64_t end_lpn = (lba + len - 1) / spp->secs_per_pg;
+    #elif FTL_MAPPING_TBL_MODE == 1
+        int len = req->nlb;
+        uint64_t start_lpn = lba / spp->secs_per_blk;
+        uint64_t end_lpn = (lba + len - 1) / spp->secs_per_blk;
+    #elif FTL_MAPPING_TBL_MODE = =2
+        
+    #endif
+    
     struct ppa ppa;
     uint64_t lpn;
     uint64_t curlat = 0, maxlat = 0;
     int r;
 
+    // TODO: assert the offset for block-based mapping
     if (end_lpn >= spp->tt_pgs) {
         ftl_err("start_lpn=%"PRIu64",tt_pgs=%d\n", start_lpn, ssd->sp.tt_pgs);
     }
 
     while (should_gc_high(ssd)) {
         /* perform GC here until !should_gc(ssd) */
+        // erase and copy back the data
         r = do_gc(ssd, true);
         if (r == -1)
             break;
     }
 
     for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
-        ppa = get_maptbl_ent(ssd, lpn);
+        #if FTL_MAPPING_TBL_MODE == 0
+            ppa = get_maptbl_ent(ssd, lpn);
+        #elif FTL_MAPPING_TBL_MODE == 1
+            ppa = get_maptbl_ent(ssd, lpn);
+            uint64_t offset = lba % spp->secs_per_blk;
+            ppa.g.pg = ppa.g.pg + offset;
+        #elif FTL_MAPPING_TBL_MODE == 2
+            
+        #endif
+
         if (mapped_ppa(&ppa)) {
             /* update old page information first */
             mark_page_invalid(ssd, &ppa);
             set_rmap_ent(ssd, INVALID_LPN, &ppa);
+
+            // for block-based mapping, maybe ?
+            #if FTL_MAPPING_TBL_MODE == 1
+                
+            #elif FTL_MAPPING_TBL_MODE == 2
+
+            #endif
         }
 
         /* new write */
